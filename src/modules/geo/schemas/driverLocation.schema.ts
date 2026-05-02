@@ -26,6 +26,10 @@ export class DriverLocation {
 
   @Prop({ type: Date, default: Date.now })
   updatedAt: Date;
+
+  /** When false, driver is excluded from nearby search (e.g. went offline). */
+  @Prop({ type: Boolean, default: true })
+  availableForMatching: boolean;
 }
 
 export const DriverLocationSchema = SchemaFactory.createForClass(DriverLocation);

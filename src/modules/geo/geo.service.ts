@@ -44,6 +44,7 @@ export class GeoService {
           coordinates: [data.longitude, data.latitude], // GeoJSON format: [longitude, latitude]
         },
         updatedAt: new Date(),
+        availableForMatching: true,
       },
       {
         upsert: true,
@@ -89,6 +90,7 @@ export class GeoService {
     // Find nearby drivers using geospatial query
     const nearbyDrivers = await this.driverLocationModel
       .find({
+        availableForMatching: { $ne: false },
         location: {
           $nearSphere: {
             $geometry: {
@@ -124,6 +126,43 @@ export class GeoService {
     results.sort((a, b) => a.distanceInMeters - b.distanceInMeters);
 
     return results;
+  }
+
+  /**
+   * Count drivers available for matching near a point (same rules as findNearby, no limit cap).
+   */
+  async countAvailableDrivers(data: FindNearbyDto): Promise<{ count: number }> {
+    if (
+      data.latitude < -90 ||
+      data.latitude > 90 ||
+      data.longitude < -180 ||
+      data.longitude > 180
+    ) {
+      throw new BadRequestException(ErrorMessages.INVALID_COORDINATES);
+    }
+    if (data.radiusInMeters <= 0) {
+      throw new BadRequestException(ErrorMessages.INVALID_RADIUS);
+    }
+
+    const count = await this.driverLocationModel.countDocuments({
+      availableForMatching: { $ne: false },
+      location: {
+        $nearSphere: {
+          $geometry: {
+            type: 'Point',
+            coordinates: [data.longitude, data.latitude],
+          },
+          $maxDistance: data.radiusInMeters,
+        },
+      },
+    });
+
+    this.logger.log(
+      `Counted ${count} available drivers near [${data.latitude}, ${data.longitude}] (${data.radiusInMeters}m)`,
+      'Geo Service - countAvailableDrivers',
+    );
+
+    return { count };
   }
 
   /**
@@ -169,6 +208,33 @@ export class GeoService {
     const timeInHours = distanceInKm / AVERAGE_SPEED_KMH;
     const timeInMinutes = timeInHours * 60;
     return timeInMinutes;
+  }
+
+  /**
+   * Driver went online: include existing location in matching again (no GPS in event).
+   * New drivers still need at least one update-location to create a geo document.
+   */
+  async markDriverAvailableForMatching(driverId: string): Promise<void> {
+    const result = await this.driverLocationModel.updateOne(
+      { driverId },
+      { $set: { availableForMatching: true, updatedAt: new Date() } },
+    );
+    if (result.matchedCount === 0) {
+      this.logger.log(
+        `Driver ${driverId} online: no geo document yet (waiting for update-location).`,
+        'Geo Service - markDriverAvailableForMatching',
+      );
+    }
+  }
+
+  /**
+   * Driver went offline: hide from nearby search but keep last coordinates for when they return.
+   */
+  async markDriverUnavailableForMatching(driverId: string): Promise<void> {
+    await this.driverLocationModel.updateOne(
+      { driverId },
+      { $set: { availableForMatching: false, updatedAt: new Date() } },
+    );
   }
 }
 

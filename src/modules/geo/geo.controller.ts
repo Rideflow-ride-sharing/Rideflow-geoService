@@ -1,4 +1,4 @@
-import { Controller } from '@nestjs/common';
+import { BadRequestException, Controller } from '@nestjs/common';
 import { MessagePattern, Payload, RpcException } from '@nestjs/microservices';
 import { GeoService } from './geo.service';
 import { LoggerService } from '../../common/logger/logger.service';
@@ -84,6 +84,42 @@ export class GeoController {
         `Error in finding nearby drivers: ${error.message || JSON.stringify(error)}`,
         error.stack,
         'Geo Service - handleFindNearbyDrivers',
+      );
+
+      throw new RpcException({
+        statusCode: error.status || error.statusCode || 500,
+        message: error.message || ErrorMessages.INTERNAL_NEARBY_SEARCH,
+      });
+    }
+  }
+
+  @MessagePattern({ cmd: commands.COUNT_AVAILABLE_DRIVERS })
+  async handleCountAvailableDrivers(@Payload() data: any) {
+    try {
+      this.logger.log(
+        `Received count available drivers request`,
+        'Geo Service - handleCountAvailableDrivers',
+      );
+
+      if (
+        typeof data?.latitude !== 'number' ||
+        typeof data?.longitude !== 'number' ||
+        typeof data?.radiusInMeters !== 'number'
+      ) {
+        throw new BadRequestException('Required: latitude, longitude, radiusInMeters');
+      }
+
+      const result = await this.geoService.countAvailableDrivers(data as FindNearbyDto);
+
+      return {
+        data: result,
+        message: SuccessMessages.NEARBY_DRIVERS_FOUND,
+      };
+    } catch (error) {
+      this.logger.error(
+        `Error counting available drivers: ${error.message || JSON.stringify(error)}`,
+        error.stack,
+        'Geo Service - handleCountAvailableDrivers',
       );
 
       throw new RpcException({
