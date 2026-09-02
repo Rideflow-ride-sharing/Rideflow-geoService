@@ -8,6 +8,10 @@ import { LoggerService } from '../../common/logger/logger.service';
 import { ErrorMessages, SuccessMessages, AVERAGE_SPEED_KMH } from '../../common/constants';
 import { DriverLocation, DriverLocationDocument } from './schemas';
 import { UpdateLocationDto, FindNearbyDto } from './dto';
+import { RedisService } from './redis.service';
+import { Cron, CronExpression } from '@nestjs/schedule';
+import { ConfigService } from '@nestjs/config';
+import { ClientProxy } from '@nestjs/microservices';
 
 @Injectable()
 export class GeoService {
@@ -15,6 +19,8 @@ export class GeoService {
     @InjectModel(DriverLocation.name)
     private driverLocationModel: Model<DriverLocationDocument>,
     private readonly logger: LoggerService,
+    private readonly redisService: RedisService,
+    private readonly configService: ConfigService,
   ) {}
 
   async updateDriverLocation(data: UpdateLocationDto) {
@@ -34,24 +40,104 @@ export class GeoService {
       throw new BadRequestException(ErrorMessages.INVALID_COORDINATES);
     }
 
-    // Update or create driver location
-    const location = await this.driverLocationModel.findOneAndUpdate(
-      { driverId: data.driverId },
-      {
-        driverId: data.driverId,
-        location: {
-          type: 'Point',
-          coordinates: [data.longitude, data.latitude], // GeoJSON format: [longitude, latitude]
-        },
-        updatedAt: new Date(),
-        availableForMatching: true,
-      },
-      {
-        upsert: true,
-        new: true,
-      },
-    );
+    const updatedAt = new Date();
+    const locationData = {
+      driverId: data.driverId,
+      latitude: data.latitude,
+      longitude: data.longitude,
+      updatedAt: updatedAt.toISOString(),
+      availableForMatching: true,
+    };
 
+    const redis = this.redisService.getClient();
+    // Set a TTL (e.g., 10 minutes = 600 seconds) so old locations don't pile up in memory
+    // If a driver stops sending updates, their record naturally expires from Redis, 
+    // freeing up memory, while remaining permanently safe in MongoDB.
+    await redis.set(`driver:location:${data.driverId}`, JSON.stringify(locationData), 'EX', 600);
+    await redis.sadd('drivers:dirty_locations', data.driverId);
+    
+    // Broadcast instantly to all subscribers (e.g. API Gateway)
+    await redis.publish('driver_location_stream', JSON.stringify(locationData));
+
+    // Instead of throwing errors if RabbitMQ is down, we just want to return the location to the driver.
+    // The driver doesn't need to wait for RabbitMQ to finish to know their location was received.
+
+    return {
+      driverId: locationData.driverId,
+      latitude: locationData.latitude,
+      longitude: locationData.longitude,
+      updatedAt,
+      // signal that we pushed this
+      _published: true,
+    };
+  }
+
+  @Cron(process.env.LOCATION_PERSIST_INTERVAL_MS ? `*/${parseInt(process.env.LOCATION_PERSIST_INTERVAL_MS)/1000} * * * * *` : CronExpression.EVERY_5_SECONDS)
+  async persistLocations() {
+    const redis = this.redisService.getClient();
+    const dirtyDrivers = await redis.smembers('drivers:dirty_locations');
+    
+    if (!dirtyDrivers || dirtyDrivers.length === 0) {
+      return;
+    }
+
+    this.logger.log(`Persisting ${dirtyDrivers.length} driver locations to MongoDB`, 'Geo Service - persistLocations');
+    
+    const bulkOps: any[] = [];
+    
+    for (const driverId of dirtyDrivers) {
+      const dataStr = await redis.get(`driver:location:${driverId}`);
+      if (dataStr) {
+        const data = JSON.parse(dataStr);
+        bulkOps.push({
+          updateOne: {
+            filter: { driverId },
+            update: {
+              $set: {
+                driverId,
+                location: {
+                  type: 'Point',
+                  coordinates: [data.longitude, data.latitude],
+                },
+                updatedAt: new Date(data.updatedAt),
+                availableForMatching: data.availableForMatching,
+              }
+            },
+            upsert: true,
+          }
+        });
+      }
+      await redis.srem('drivers:dirty_locations', driverId);
+    }
+
+    if (bulkOps.length > 0) {
+      await this.driverLocationModel.bulkWrite(bulkOps);
+    }
+  }
+
+  async getDriverLocation(driverId: string) {
+    this.logger.log(`Fetching location for driver: ${driverId}`, 'Geo Service - getDriverLocation');
+    
+    const redis = this.redisService.getClient();
+    const dataStr = await redis.get(`driver:location:${driverId}`);
+    
+    if (dataStr) {
+      const data = JSON.parse(dataStr);
+      return {
+        driverId: data.driverId,
+        latitude: data.latitude,
+        longitude: data.longitude,
+        updatedAt: new Date(data.updatedAt),
+      };
+    }
+    
+    // Fallback to MongoDB
+    const location = await this.driverLocationModel.findOne({ driverId });
+    
+    if (!location) {
+      return null;
+    }
+    
     return {
       driverId: location.driverId,
       latitude: location.location.coordinates[1],
@@ -147,12 +233,11 @@ export class GeoService {
     const count = await this.driverLocationModel.countDocuments({
       availableForMatching: { $ne: false },
       location: {
-        $nearSphere: {
-          $geometry: {
-            type: 'Point',
-            coordinates: [data.longitude, data.latitude],
-          },
-          $maxDistance: data.radiusInMeters,
+        $geoWithin: {
+          $centerSphere: [
+            [data.longitude, data.latitude],
+            data.radiusInMeters / 6378137, // Earth's equatorial radius in meters
+          ],
         },
       },
     });

@@ -48,6 +48,34 @@ export class GeoController {
     }
   }
 
+  @MessagePattern({ cmd: commands.GET_DRIVER_LOCATION })
+  async handleGetDriverLocation(@Payload() data: { driverId: string }) {
+    try {
+      this.logger.log(
+        `Received request to get driver location: ${data.driverId}`,
+        'Geo Service - handleGetDriverLocation',
+      );
+
+      const location = await this.geoService.getDriverLocation(data.driverId);
+
+      return {
+        data: location,
+        message: 'Driver location retrieved successfully',
+      };
+    } catch (error) {
+      this.logger.error(
+        `Error getting driver location: ${JSON.stringify(error)}`,
+        error.stack,
+        'Geo Service - handleGetDriverLocation',
+      );
+
+      throw new RpcException({
+        statusCode: error.status || 500,
+        message: error.message || 'Failed to get driver location',
+      });
+    }
+  }
+
   @MessagePattern({ cmd: commands.FIND_NEARBY_DRIVERS })
   async handleFindNearbyDrivers(@Payload() data: any) {
     try {
